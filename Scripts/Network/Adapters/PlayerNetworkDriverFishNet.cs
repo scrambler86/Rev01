@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEngine.AI;
 using FishNet.Object;
 using FishNet.Connection;
@@ -10,9 +10,8 @@ using System.Collections.Generic;
 [RequireComponent(typeof(Rigidbody))]
 public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 {
-    // ====== STATIC QUIT GUARD (no dipendenze esterne) ======
+    // --- quit guard (niente costruttori) ---
     private static bool s_AppQuitting = false;
-    static PlayerNetworkDriverFishNet() { Application.quitting += OnAppQuit; }
     private static void OnAppQuit() { s_AppQuitting = true; }
 
     [Header("Refs")]
@@ -36,8 +35,8 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     public float reconcileRate = 12f;
 
     [Header("Anti-cheat (Server)")]
-    public float maxSpeedTolerance = 1.18f; // base
-    public float slackK = 0.6f;             // stepSlack = 1 + (RTT_oneway*2)*K
+    public float maxSpeedTolerance = 1.18f;
+    public float slackK = 0.6f;
     public float slackMin = 1.00f;
     public float slackMax = 1.75f;
     public bool validateNavMesh = true;
@@ -53,14 +52,14 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     public float remoteVisualLerpSpeed = 16f;
 
     [Header("Height policy")]
-    public bool ignoreNetworkY = true; // usa Y locale da ground probe
+    public bool ignoreNetworkY = true;
 
     [Header("Broadcast Scheduler (per-conn)")]
     public int nearRing = 1, midRing = 2, farRing = 3;
     public int nearHz = 30, midHz = 10, farHz = 3;
 
     [Header("Delta Compression")]
-    public int keyframeEvery = 20; // 0 = off
+    public int keyframeEvery = 20;
     public int maxPosDeltaCm = 60;
     public int maxVelDeltaCms = 150;
     public int maxDtMs = 200;
@@ -71,7 +70,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     public float refillPerSecond = 120f;
 
     [Header("DEBUG / Fallback")]
-    public bool forceBroadcastAll = false; // true = invia a tutti via ObserversRpc
+    public bool forceBroadcastAll = false;
 
     // IPlayerNetworkDriver
     public INetTime NetTime => _netTime;
@@ -95,46 +94,44 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     private Vector3 _serverLastPos;
     private double _serverLastTime;
 
-    // remoti anim
     private Vector3 _remoteLastRenderPos;
     private float _remoteDisplaySpeed;
 
     private readonly Queue<InputState> _inputBuf = new(128);
 
-    // AOI temp
     private readonly HashSet<NetworkConnection> _tmpNear = new();
-    private readonly HashSet<NetworkConnection> _tmpMid = new();
-    private readonly HashSet<NetworkConnection> _tmpFar = new();
+    private readonly HashSet<NetworkConnection> _tmpMid  = new();
+    private readonly HashSet<NetworkConnection> _tmpFar  = new();
     private readonly Dictionary<NetworkConnection, double> _nextSendAt = new();
     private double _nearInterval, _midInterval, _farInterval;
 
-    // delta compression (server per conn)
     private readonly Dictionary<NetworkConnection, MovementSnapshot> _lastSentSnap = new();
     private readonly Dictionary<NetworkConnection, int> _sinceKeyframe = new();
     private readonly Dictionary<NetworkConnection, (short cellX, short cellY)> _lastSentCell = new();
 
-    // delta anchor (client)
     private bool _haveAnchor;
     private short _anchorCellX, _anchorCellY;
     private MovementSnapshot _baseSnap;
 
-    // rate limit (server per player)
     private float _tokens;
     private double _lastRefill;
 
-    // teardown guard
     private bool _shuttingDown;
 
     void Awake()
     {
-        if (!_core) _core = GetComponent<PlayerControllerCore>();
-        if (!_rb) _rb = GetComponent<Rigidbody>();
+        // hook qui (no costruttore)
+        Application.quitting -= OnAppQuit;
+        Application.quitting += OnAppQuit;
+
+        if (!_core)  _core  = GetComponent<PlayerControllerCore>();
+        if (!_rb)    _rb    = GetComponent<Rigidbody>();
         if (!_agent) _agent = GetComponent<NavMeshAgent>();
-        if (!_ctm) _ctm = GetComponent<ClickToMoveAgent>();
+        if (!_ctm)   _ctm   = GetComponent<ClickToMoveAgent>();
 
         _netTime = new NetTimeFishNet();
-        _anti = FindObjectOfType<AntiCheatManager>();
-        _chunk = FindObjectOfType<ChunkManager>();
+        _anti    = FindObjectOfType<AntiCheatManager>();
+        _chunk   = FindObjectOfType<ChunkManager>();
     }
 
     public override void OnStartClient()
@@ -143,8 +140,8 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
         _sendDt = 1f / Mathf.Max(1, sendRateHz);
         _nearInterval = 1.0 / Math.Max(1, nearHz);
-        _midInterval = 1.0 / Math.Max(1, midHz);
-        _farInterval = 1.0 / Math.Max(1, farHz);
+        _midInterval  = 1.0 / Math.Max(1, midHz);
+        _farInterval  = 1.0 / Math.Max(1, farHz);
 
         _core.SetAllowInput(IsOwner);
 
@@ -154,7 +151,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         }
         else
         {
-            _rb.isKinematic = true; _rb.detectCollisions = false; _rb.interpolation = RigidbodyInterpolation.None;
+            _rb.isKinematic = true;  _rb.detectCollisions = false; _rb.interpolation = RigidbodyInterpolation.None;
             _remoteLastRenderPos = transform.position;
             _remoteDisplaySpeed = 0f;
         }
@@ -276,7 +273,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             t = Mathf.Clamp01(t);
 
             bool lowVel = (A.vel.sqrMagnitude < 0.0001f && B.vel.sqrMagnitude < 0.0001f);
-            bool tinyMove = (A.pos - B.pos).sqrMagnitude < 0.000004f; // <2mm
+            bool tinyMove = (A.pos - B.pos).sqrMagnitude < 0.000004f;
             Vector3 target = lowVel || tinyMove
                 ? Vector3.Lerp(A.pos, B.pos, t)
                 : Hermite(A.pos, A.vel * (float)span, B.pos, B.vel * (float)span, t);
@@ -294,7 +291,6 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         }
     }
 
-    // ---- rotazione remota anti “moonwalk” + smoothing ----
     void DriveRemote(Vector3 target, byte animState)
     {
         if (ignoreNetworkY && _core != null)
@@ -307,7 +303,6 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
         if (remoteMoveVisualOnly && vr) vr.position = smoothed; else _rb.position = smoothed;
 
-        // velocità + direzione per facing
         Vector3 moveVec = smoothed - _remoteLastRenderPos;
         float dt = Mathf.Max(Time.deltaTime, 1e-6f);
         float rawSpeed = moveVec.magnitude / dt;
@@ -326,13 +321,10 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
         _remoteLastRenderPos = smoothed;
 
-        // anim
         _core.SafeAnimSpeedRaw(_remoteDisplaySpeed);
         bool shouldRun = (animState == 2) && (_remoteDisplaySpeed > remoteRunSpeedThreshold * 0.75f);
         _core.SafeAnimRun(shouldRun);
     }
-
-    // ==================== SERVER ====================
 
     bool RateLimitOk(double now)
     {
@@ -358,7 +350,6 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         double dt = Math.Max(0.001, now - _serverLastTime);
         _serverLastTime = now;
 
-        // slack dinamico in base alla latenza del singolo pacchetto
         double oneWay = Math.Max(0.0, now - timestamp);
         float stepSlack = Mathf.Clamp(1f + (float)(oneWay * 2.0) * slackK, slackMin, slackMax);
 
@@ -404,12 +395,12 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         }
 
         _chunk.CollectWithinRadius(Owner, nearRing, _tmpNear);
-        _chunk.CollectWithinRadius(Owner, midRing, _tmpMid);
-        _chunk.CollectWithinRadius(Owner, farRing, _tmpFar);
+        _chunk.CollectWithinRadius(Owner, midRing,  _tmpMid);
+        _chunk.CollectWithinRadius(Owner, farRing,  _tmpFar);
 
         foreach (var c in _tmpNear) _tmpMid.Remove(c);
         foreach (var c in _tmpNear) _tmpFar.Remove(c);
-        foreach (var c in _tmpMid) _tmpFar.Remove(c);
+        foreach (var c in _tmpMid)  _tmpFar.Remove(c);
 
         double now = _netTime.Now();
 
@@ -417,8 +408,8 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         if (_chunk.TryGetCellOf(Owner, out var cell)) { cellX = (short)cell.x; cellY = (short)cell.y; }
 
         foreach (var conn in _tmpNear) TrySendPackedTo(conn, snap, cellX, cellY, now, 1.0 / Math.Max(1, nearHz));
-        foreach (var conn in _tmpMid) TrySendPackedTo(conn, snap, cellX, cellY, now, 1.0 / Math.Max(1, midHz));
-        foreach (var conn in _tmpFar) TrySendPackedTo(conn, snap, cellX, cellY, now, 1.0 / Math.Max(1, farHz));
+        foreach (var conn in _tmpMid)  TrySendPackedTo(conn, snap, cellX, cellY, now, 1.0 / Math.Max(1, midHz));
+        foreach (var conn in _tmpFar)  TrySendPackedTo(conn, snap, cellX, cellY, now, 1.0 / Math.Max(1, farHz));
 
         _tmpNear.Clear(); _tmpMid.Clear(); _tmpFar.Clear();
     }
@@ -466,7 +457,6 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             _sinceKeyframe[conn] = sinceKF + 1;
         }
 
-        // NB: TargetRpc richiede che 'conn' sia OBSERVER di questo NetworkObject.
         TargetPackedSnapshotTo(conn, payload);
 
         _lastSentSnap[conn] = snap;
@@ -512,9 +502,9 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
         double now = _netTime.Now();
         double delay = Math.Max(0.0, now - snap.serverTime);
-        _emaDelay = (_emaDelay <= 0.0) ? delay : (1.0 - emaDelayA) * _emaDelay + emaDelayA * delay;
+        _emaDelay  = (_emaDelay  <= 0.0) ? delay : (1.0 - emaDelayA)  * _emaDelay  + emaDelayA  * delay;
         double dev = Math.Abs(delay - _emaDelay);
-        _emaJitter = (_emaJitter <= 0.0) ? dev : (1.0 - emaJitterA) * _emaJitter + emaJitterA * dev;
+        _emaJitter = (_emaJitter <= 0.0) ? dev   : (1.0 - emaJitterA) * _emaJitter + emaJitterA * dev;
 
         double targetBack = _emaDelay * 1.35 + _emaJitter * 1.6;
         _backTarget = ClampD(targetBack, minBack, maxBack);
@@ -562,11 +552,11 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     static Vector3 Hermite(Vector3 p0, Vector3 v0, Vector3 p1, Vector3 v1, float t)
     {
         float t2 = t * t, t3 = t2 * t;
-        float h00 = 2f * t3 - 3f * t2 + 1f;
-        float h10 = t3 - 2f * t2 + t;
-        float h01 = -2f * t3 + 3f * t2;
-        float h11 = t3 - t2;
-        return h00 * p0 + h10 * v0 + h01 * p1 + h11 * v1;
+        float h00 =  2f*t3 - 3f*t2 + 1f;
+        float h10 =       t3 - 2f*t2 + t;
+        float h01 = -2f*t3 + 3f*t2;
+        float h11 =       t3 -     t2;
+        return h00*p0 + h10*v0 + h01*p1 + h11*v1;
     }
 
     bool TryGetBracket(double renderT, out MovementSnapshot A, out MovementSnapshot B)
