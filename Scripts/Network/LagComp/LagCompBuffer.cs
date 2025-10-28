@@ -1,57 +1,49 @@
-using System;
+using System.Collections.Generic;
 using UnityEngine;
 
+/// <summary>
+/// Buffer storico per lag compensation (server-side).
+/// Conserva pos/vel con timestamp serverTime e permette sampling al tempo passato.
+/// </summary>
 public class LagCompBuffer : MonoBehaviour
 {
-    [Serializable]
-    public struct Sample
-    {
-        public Vector3 pos;
-        public Vector3 vel;
-        public double serverTime;
-    }
+    struct Sample { public Vector3 p, v; public double t; }
 
-    public int capacity = 128; // ~4s @30Hz
-    private Sample[] _buf;
-    private int _head;
-    private bool _filled;
+    [SerializeField] int maxSamples = 96; // ~3.2s @30Hz
+    private readonly List<Sample> _buf = new();
 
-    void Awake()
-    {
-        _buf = new Sample[Mathf.Max(16, capacity)];
-        _head = 0; _filled = false;
-    }
-
+    /// <summary>Push di un nuovo campione (chiamato dal server ad ogni tick del player).</summary>
     public void Push(Vector3 pos, Vector3 vel, double serverTime)
     {
-        _buf[_head] = new Sample { pos = pos, vel = vel, serverTime = serverTime };
-        _head = (_head + 1) % _buf.Length;
-        if (_head == 0) _filled = true;
+        _buf.Add(new Sample { p = pos, v = vel, t = serverTime });
+        if (_buf.Count > maxSamples)
+            _buf.RemoveAt(0);
     }
 
-    public bool TryGetAt(double t, out Sample s0, out Sample s1, out float alpha)
+    /// <summary>Interpola lo stato a un tempo passato (serverTime). Ritorna true se trovato.</summary>
+    public bool TrySampleAt(double atTime, out Vector3 pos, out Vector3 vel)
     {
-        s0 = default; s1 = default; alpha = 0f;
-        int n = _filled ? _buf.Length : _head;
-        if (n < 2) return false;
+        pos = default; vel = default;
+        if (_buf.Count == 0) return false;
 
-        for (int k = 0; k < n; k++)
+        int hi = _buf.FindIndex(s => s.t >= atTime);
+        if (hi <= 0)
         {
-            int i = (_head - 1 - k + _buf.Length) % _buf.Length;
-            int j = (i - 1 + _buf.Length) % _buf.Length;
-            var A = _buf[j];
-            var B = _buf[i];
-            if (A.serverTime <= t && B.serverTime >= t)
-            {
-                s0 = A; s1 = B;
-                double span = Math.Max(1e-6, B.serverTime - A.serverTime);
-                alpha = (float)((t - A.serverTime) / span);
-                return true;
-            }
+            pos = _buf[0].p; vel = _buf[0].v; return true;
+        }
+        if (hi >= _buf.Count)
+        {
+            var last = _buf[_buf.Count - 1];
+            pos = last.p; vel = last.v; return true;
         }
 
-        int last = (_head - 1 + _buf.Length) % _buf.Length;
-        s0 = _buf[last]; s1 = s0; alpha = 1f;
+        var a = _buf[hi - 1];
+        var b = _buf[hi];
+        double span = b.t - a.t;
+        float t = span > 1e-6 ? (float)((atTime - a.t) / span) : 1f;
+
+        pos = Vector3.Lerp(a.p, b.p, t);
+        vel = Vector3.Lerp(a.v, b.v, t);
         return true;
     }
 }

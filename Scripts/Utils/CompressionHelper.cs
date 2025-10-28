@@ -3,20 +3,20 @@ using System.IO;
 
 public static class CompressionHelper
 {
-    private const float SCALE = 1000f; // 1mm precision
+    private const float SCALE = 100f; // 1cm precision (pos/vel stored as Int32)
 
     public static byte[] CompressSnapshot(Vector3 pos, Vector3 vel, byte animState, uint seq, double time)
     {
-        using (var ms = new MemoryStream(32))
+        using (var ms = new MemoryStream(48))
         using (var bw = new BinaryWriter(ms))
         {
-            bw.Write((short)Mathf.Clamp(pos.x * SCALE, -32768, 32767));
-            bw.Write((short)Mathf.Clamp(pos.y * SCALE, -32768, 32767));
-            bw.Write((short)Mathf.Clamp(pos.z * SCALE, -32768, 32767));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(pos.x * SCALE), int.MinValue, int.MaxValue));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(pos.y * SCALE), int.MinValue, int.MaxValue));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(pos.z * SCALE), int.MinValue, int.MaxValue));
 
-            bw.Write((short)Mathf.Clamp(vel.x * SCALE, -32768, 32767));
-            bw.Write((short)Mathf.Clamp(vel.y * SCALE, -32768, 32767));
-            bw.Write((short)Mathf.Clamp(vel.z * SCALE, -32768, 32767));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(vel.x * SCALE), int.MinValue, int.MaxValue));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(vel.y * SCALE), int.MinValue, int.MaxValue));
+            bw.Write((int)Mathf.Clamp(Mathf.RoundToInt(vel.z * SCALE), int.MinValue, int.MaxValue));
 
             bw.Write(animState);
             bw.Write(seq);
@@ -32,15 +32,15 @@ public static class CompressionHelper
         using (var br = new BinaryReader(ms))
         {
             Vector3 pos = new Vector3(
-                br.ReadInt16() / SCALE,
-                br.ReadInt16() / SCALE,
-                br.ReadInt16() / SCALE
+                br.ReadInt32() / SCALE,
+                br.ReadInt32() / SCALE,
+                br.ReadInt32() / SCALE
             );
 
             Vector3 vel = new Vector3(
-                br.ReadInt16() / SCALE,
-                br.ReadInt16() / SCALE,
-                br.ReadInt16() / SCALE
+                br.ReadInt32() / SCALE,
+                br.ReadInt32() / SCALE,
+                br.ReadInt32() / SCALE
             );
 
             byte animState = br.ReadByte();

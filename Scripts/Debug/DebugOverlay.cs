@@ -1,34 +1,59 @@
 using UnityEngine;
-using UnityEngine.UI;
 using FishNet;
 
 public class DebugOverlay : MonoBehaviour
 {
-    [SerializeField] Text fpsText;
-    [SerializeField] Text pingText;
-    [SerializeField] Text rttText;
-    [SerializeField] Text backtimeText;
-    [SerializeField] Text desyncText;
-    [SerializeField] Text bandwidthText;
+    public bool showNet = true;
+    public bool showAoi = true;
 
-    void Update()
+    private ChunkManager _aoi;
+    private readonly System.Collections.Generic.List<(Vector2Int cell, int count)> _cells = new();
+
+    void Awake()
     {
-        // ... il tuo HUD (non modificato)
+        _aoi = FindObjectOfType<ChunkManager>();
     }
 
-    void OnDrawGizmos()
+    void OnGUI()
     {
-        var chunkManager = FindObjectOfType<ChunkManager>();
-        if (chunkManager == null || chunkManager.Entities == null) return;
+        var style = new GUIStyle(GUI.skin.label) { fontSize = 13, richText = true };
 
-        int cs = Mathf.Max(1, chunkManager.cellSize);
-        Gizmos.color = Color.cyan;
+        GUILayout.BeginArea(new Rect(10, 10, 480, Screen.height - 20), GUI.skin.box);
+        GUILayout.Label("<b>DEBUG OVERLAY</b>", style);
 
-        foreach (var key in chunkManager.Entities.Keys)
+        if (showNet)
         {
-            // centro cella
-            Vector3 center = new Vector3(key.x * cs + cs * 0.5f, 0, key.y * cs + cs * 0.5f);
-            Gizmos.DrawWireCube(center, new Vector3(cs, 100, cs));
+            var cm = InstanceFinder.ClientManager;
+            var sm = InstanceFinder.ServerManager;
+            bool clientStarted = (cm != null && cm.Started);
+            bool serverStarted = (sm != null && sm.Started);
+            GUILayout.Label($"NET: ServerStarted={serverStarted}  ClientStarted={clientStarted}", style);
         }
+
+        if (showAoi)
+        {
+            if (_aoi == null)
+                _aoi = FindObjectOfType<ChunkManager>();
+
+            if (_aoi != null)
+            {
+                int players = _aoi.GetRegisteredCount();
+                _aoi.GetCellsSnapshot(_cells);
+                GUILayout.Label($"AOI: players={players}  cells={_cells.Count}", style);
+
+                // elenco celle attive
+                for (int i = 0; i < _cells.Count; i++)
+                {
+                    var e = _cells[i];
+                    GUILayout.Label($"  cell {e.cell.x},{e.cell.y} -> {e.count}", style);
+                }
+            }
+            else
+            {
+                GUILayout.Label("AOI: ChunkManager non trovato in scena.", style);
+            }
+        }
+
+        GUILayout.EndArea();
     }
 }

@@ -1,11 +1,10 @@
-using UnityEngine;
-
-public interface IPlayerNetworkDriver
+﻿public interface IPlayerNetworkDriver
 {
-    int OwnerClientId { get; }   // rinominato per non oscurare NetworkBehaviour.OwnerId
-    uint LastSeqReceived { get; }
     INetTime NetTime { get; }
-
+    int OwnerClientId { get; }
+    uint LastSeqReceived { get; }
     void SetLastSeqReceived(uint seq);
-    Transform transform { get; }
+
+    // 👉 nuovo: RTT misurato per questo client (ms), lato server
+    double ClientRttMs { get; }
 }
