@@ -1,14 +1,14 @@
-﻿using UnityEngine;
-using UnityEngine.AI;
-using FishNet.Object;
-using FishNet.Connection;
-using FishNet;
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using FishNet;
+using FishNet.Connection;
+using FishNet.Object;
 using Game.Network; // for ClockSyncManager (client-side hook)
+using UnityEngine;
+using UnityEngine.AI;
 
 [RequireComponent(typeof(PlayerControllerCore))]
 [RequireComponent(typeof(Rigidbody))]
@@ -45,10 +45,8 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     public float hardSnapRateLimitSeconds = 1.0f;
 
     [Header("FEC parity (full-keyframe)")]
-    [Tooltip("Number of parity shards (simple XOR). 0 = disabled")]
-    public int fecParityShards = 1;
-    [Tooltip("Max bytes per shard during splitting")]
-    public int fecShardSize = 1024;
+    [Tooltip("Number of parity shards (simple XOR). 0 = disabled")] public int fecParityShards = 1;
+    [Tooltip("Max bytes per shard during splitting")] public int fecShardSize = 1024;
 
     [Header("Elastic correction (client)")]
     public float correctionDurationSeconds = 0.25f;
@@ -95,6 +93,10 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     [Header("DEBUG / Tests")]
     [Tooltip("When true forces sending full snapshots (no delta/FEC) to help isolate CRC/fragmentation issues")]
     public bool debugForceFullSnapshots = false;
+
+    [Header("Debug Logging")]
+    [Tooltip("Abilita log verbosi di rete. Disattivalo nelle build per evitare spam/log overhead.")]
+    public bool verboseNetLog = false;
 
     // ==== IPlayerNetworkDriver ====
     public INetTime NetTime => _netTime;
@@ -181,6 +183,21 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     private double _crcLastLogTime = -9999.0;
     private const double CRC_LOG_WINDOW_SECONDS = 5.0; // window to accumulate events
     private const int CRC_LOG_MAX_PER_WINDOW = 5; // max logs emitted per window
+
+    // monotonic message id generator used for shards/full envelopes
+    private uint _nextOutgoingMessageId = 1;
+
+    // ---------- shard reassembly per-messageId (client) ----------
+    private readonly Dictionary<uint, List<ShardInfo>> _shardBuffers = new Dictionary<uint, List<ShardInfo>>();
+    private readonly Dictionary<uint, int> _shardTotalCount = new Dictionary<uint, int>();
+    private readonly Dictionary<uint, double> _shardFirstReceivedAt = new Dictionary<uint, double>();
+    private const double SHARD_BUFFER_TIMEOUT_SECONDS = 2.0; // timeout fallback: request full if incomplete
+
+    // Diagnostics: map incoming envelope messageId -> server-provided payloadHash / payloadLen
+    private readonly Dictionary<uint, (ulong hash, int len)> _incomingEnvelopeMeta = new Dictionary<uint, (ulong, int)>();
+
+    // Track messageIds flagged as CANARY so we don't try to decode them as movement
+    private readonly HashSet<uint> _canaryMessageIds = new HashSet<uint>();
 
     // ---------- lifecycle ----------
     void Awake()
@@ -270,6 +287,9 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     {
         if (!IsSpawned || _shuttingDown || s_AppQuitting)
             return;
+
+        // check shard buffer timeouts for client-side reassembly
+        CheckShardBufferTimeouts();
 
         if (IsOwner)
         {
@@ -363,7 +383,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
                     }
                     else
                     {
-                        float alpha = 1f - Mathf.Exp(-reconcileRate * Time.fixedDeltaTime);
+                        float alpha = 1f - Mathf.Exp(-reconcileRate * Time.fixedDeltaTime * 0.66f); // slightly slower smoothing
                         Vector3 desired = Vector3.Lerp(cur, _reconcileTarget, alpha);
                         Vector3 capped = Vector3.MoveTowards(cur, desired, maxAllowed);
                         Vector3 smoothed = Vector3.Lerp(cur, capped, 1f - reconciliationSmoothing);
@@ -413,11 +433,24 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
                 {
                     if (_lastFullShards.TryGetValue(conn, out var shards) && shards != null && shards.Count > 0)
                     {
-                        foreach (var s in shards) TargetPackedShardTo(conn, s);
+                        byte[] lastFull = null;
+                        if (_lastFullPayload.TryGetValue(conn, out var lf)) lastFull = lf;
+                        ulong fullHash = (lastFull != null) ? EnvelopeUtil.ComputeHash64(lastFull) : 0;
+                        int fullLen = (lastFull != null) ? lastFull.Length : 0;
+
+                        uint messageId = _nextOutgoingMessageId++;
+                        if (verboseNetLog) Debug.Log($"[Server.Debug] Retry sending shards messageId={messageId} totalShards={shards.Count} fullLen={fullLen} fullHash=0x{fullHash:X16}");
+                        foreach (var s in shards)
+                        {
+                            if (verboseNetLog) Debug.Log($"[Server.Debug] Retry shard len={s.Length} first8={BytesPreview(s, 8)}");
+                            byte[] envelopeBytes = CreateEnvelopeBytesForShard(s, messageId, fullLen, fullHash);
+                            TargetPackedShardTo(conn, envelopeBytes);
+                        }
                     }
                     else if (_lastFullPayload.TryGetValue(conn, out var payload))
                     {
-                        TargetPackedSnapshotTo(conn, payload, ComputeStateHashFromPayload(payload));
+                        byte[] payloadEnv = CreateEnvelopeBytes(payload);
+                        TargetPackedSnapshotTo(conn, payloadEnv, ComputeStateHashFromPayload(payload));
                     }
                     _lastFullSentAt[conn] = _netTime.Now();
                     _fullRetryCount[conn] = _fullRetryCount.TryGetValue(conn, out var old) ? old + 1 : 1;
@@ -470,7 +503,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     {
         if (_buffer.Count == 0) return;
 
-        _back = Mathf.Lerp((float)_back, (float)_backTarget, Time.deltaTime * 3f);
+        _back = Mathf.Lerp((float)_back, (float)_backTarget, Time.deltaTime * 1.0f); // slower smoothing
         double now = _netTime.Now();
         double renderT = now - _back;
 
@@ -482,7 +515,10 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
             bool lowVel = (A.vel.sqrMagnitude < 0.0001f && B.vel.sqrMagnitude < 0.0001f);
             bool tinyMove = (A.pos - B.pos).sqrMagnitude < 0.000004f;
-            Vector3 target = lowVel || tinyMove
+
+            bool useHermite = (span > 0.02 && span < 0.5 && _emaJitter < 0.12); // guard to avoid overshoot under jitter
+
+            Vector3 target = (!useHermite || lowVel || tinyMove)
                 ? Vector3.Lerp(A.pos, B.pos, t)
                 : Hermite(A.pos, A.vel * (float)span, B.pos, B.vel * (float)span, t);
 
@@ -519,10 +555,10 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         if (vr != null)
         {
             Vector3 dir = moveVec; dir.y = 0f;
-            if (dir.sqrMagnitude > 0.00004f)
+            if (dir.sqrMagnitude > 0.0004f && _remoteDisplaySpeed > 0.5f)
             {
                 Quaternion face = Quaternion.LookRotation(dir.normalized);
-                vr.rotation = Quaternion.Slerp(vr.rotation, face, Time.deltaTime * 12f);
+                vr.rotation = Quaternion.Slerp(vr.rotation, face, Time.deltaTime * 6f);
                 vr.rotation = Quaternion.Euler(0f, vr.eulerAngles.y, 0f);
             }
         }
@@ -629,7 +665,7 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
                 predictedPos = _serverLastPos;
             }
 
-            if (_anti is AntiCheatManager ac && ac.debugLogs)
+            if (_anti is AntiCheatManager ac && ac.debugLogs && verboseNetLog)
                 Debug.LogWarning($"[AC] Soft-clamp seq={seq} clientDelta={planarDist:0.###} maxStep={maxStep:0.###} rttMs={_lastRttMs:0.0}");
 
             _telemetry?.Increment($"client.{OwnerClientId}.anti_cheat.soft_clamps");
@@ -687,20 +723,36 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             // compute state hash
             ulong stateHash = ComputeStateHashForSnapshot(snap);
 
-            // build shards if FEC enabled
+            // store for retry and send
+            _lastFullPayload[Owner] = full;
+            _lastFullSentAt[Owner] = _netTime.Now();
+            _fullRetryCount[Owner] = 0;
+
+            // If FEC enabled and debug flag NOT set, build shards and send them; send message-level meta (full len/hash) with each shard
             if (fecParityShards > 0 && !debugForceFullSnapshots)
             {
                 var shards = BuildFecShards(full, fecShardSize, fecParityShards);
                 _lastFullShards[Owner] = shards;
-                // send shards to client sequentially (client will reassemble)
-                foreach (var s in shards) TargetPackedShardTo(Owner, s);
+
+                // compute full metadata once
+                ulong fullHash = EnvelopeUtil.ComputeHash64(full);
+                int fullLen = full.Length;
+                uint messageId = _nextOutgoingMessageId++;
+
+                if (verboseNetLog) Debug.Log($"[Server.Debug] Sending full as shards messageId={messageId} fullLen={fullLen} fullHash=0x{fullHash:X16} totalShards={shards.Count}");
+                for (int i = 0; i < shards.Count; i++)
+                {
+                    var s = shards[i];
+                    if (verboseNetLog) Debug.Log($"[Server.Debug] Shard idx={i} shardLen={s.Length} shardHead={BytesPreview(s, 8)}");
+                    byte[] envelopeBytes = CreateEnvelopeBytesForShard(s, messageId, fullLen, fullHash);
+                    TargetPackedShardTo(Owner, envelopeBytes);
+                }
             }
             else
             {
-                _lastFullPayload[Owner] = full;
-                _lastFullSentAt[Owner] = _netTime.Now();
-                _fullRetryCount[Owner] = 0;
-                TargetPackedSnapshotTo(Owner, full, stateHash);
+                // send full payload envelope (single envelope contains actual full)
+                byte[] fullEnv = CreateEnvelopeBytes(full);
+                TargetPackedSnapshotTo(Owner, fullEnv, stateHash);
             }
 
             _telemetry?.Increment($"client.{OwnerClientId}.full_forced");
@@ -780,7 +832,9 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
         if (forceBroadcastAll || _chunk == null || Owner == null)
         {
-            ObserversPackedSnapshot(PackFullForObservers(snap));
+            // observers path: pack full for observers and send as envelope
+            byte[] envBytes = PackFullForObservers(snap);
+            ObserversPackedSnapshot(envBytes);
             return;
         }
 
@@ -863,11 +917,25 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             {
                 var shards = BuildFecShards(payload, fecShardSize, fecParityShards);
                 _lastFullShards[conn] = shards;
-                foreach (var s in shards) TargetPackedShardTo(conn, s);
+
+                // compute full metadata once
+                ulong fullHash = EnvelopeUtil.ComputeHash64(payload);
+                int fullLen = payload.Length;
+                uint messageId = _nextOutgoingMessageId++;
+
+                if (verboseNetLog) Debug.Log($"[Server.Debug] Sending full as shards messageId={messageId} fullLen={fullLen} fullHash=0x{fullHash:X16} totalShards={shards.Count}");
+                for (int i = 0; i < shards.Count; i++)
+                {
+                    var s = shards[i];
+                    if (verboseNetLog) Debug.Log($"[Server.Debug] Shard idx={i} shardLen={s.Length} shardHead={BytesPreview(s, 8)}");
+                    byte[] envelopeBytes = CreateEnvelopeBytesForShard(s, messageId, fullLen, fullHash);
+                    TargetPackedShardTo(conn, envelopeBytes);
+                }
             }
             else
             {
-                TargetPackedSnapshotTo(conn, payload, stateHash);
+                byte[] fullEnv = CreateEnvelopeBytes(payload);
+                TargetPackedSnapshotTo(conn, fullEnv, stateHash);
             }
         }
         else
@@ -875,7 +943,11 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             _sinceKeyframe[conn] = sinceKF + 1;
             var lastSnapLocal = _lastSentSnap[conn];
             var deltaPayload = PackedMovement.PackDelta(in lastSnapLocal, snap.pos, snap.vel, snap.animState, snap.serverTime, snap.seq, cellX, cellY, _chunk.cellSize, maxPosDeltaCm, maxVelDeltaCms, maxDtMs);
-            TargetPackedSnapshotTo(conn, deltaPayload, ComputeStateHashForSnapshot(snap));
+
+            // wrap delta in envelope for consistency
+            byte[] deltaEnv = CreateEnvelopeBytes(deltaPayload);
+
+            TargetPackedSnapshotTo(conn, deltaEnv, ComputeStateHashForSnapshot(snap));
         }
 
         _lastSentSnap[conn] = snap;
@@ -886,6 +958,27 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     void ObserversPackedSnapshot(byte[] payload)
     {
         if (_shuttingDown || s_AppQuitting) return;
+
+        int olen = payload?.Length ?? 0;
+        if (verboseNetLog) Debug.Log($"[Driver.Debug] ObserversPackedSnapshot len={olen} first8={BytesPreview(payload, 8)} envelope={EnvelopeUtil.TryUnpack(payload, out var _, out var _)}");
+        if (payload == null || payload.Length < 8) { if (verboseNetLog) Debug.LogWarning($"[Driver] Ignoring too-small observers payload len={payload?.Length ?? 0}"); return; }
+
+        // Backwards-compatible: accept envelope-wrapped payloads
+        if (EnvelopeUtil.TryUnpack(payload, out var envObs, out var innerObs))
+        {
+            if ((envObs.flags & 0x08) != 0)
+            {
+                if (verboseNetLog) Debug.Log($"[Driver.Canary] observers canary id={envObs.messageId} len={envObs.payloadLen}");
+                return; // don't try to decode as movement
+            }
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] ObserversPackedSnapshot envelope id={envObs.messageId} payloadLen={envObs.payloadLen} innerFirst8={BytesPreview(innerObs, 8)}");
+            payload = innerObs;
+        }
+        else
+        {
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] ObserversPackedSnapshot raw first8={BytesPreview(payload, 8)}");
+        }
+
         HandlePackedPayload(payload);
     }
 
@@ -894,6 +987,31 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     void TargetPackedSnapshotTo(NetworkConnection conn, byte[] payload, ulong stateHash)
     {
         if (_shuttingDown || s_AppQuitting) return;
+
+        int len = payload?.Length ?? 0;
+        if (verboseNetLog) Debug.Log($"[Driver.Debug] TargetPackedSnapshotTo conn={conn?.ClientId} len={len} first8={BytesPreview(payload, 8)} envelope={EnvelopeUtil.TryUnpack(payload, out var _, out var _)}");
+        if (payload == null || payload.Length < 8) { if (verboseNetLog) Debug.LogWarning($"[Driver] Ignoring too-small payload len={payload?.Length ?? 0}"); return; }
+
+        // Support retrocompatibile: the server can send an Envelope (header+payload).
+        // If payload received is actually an envelope, extract the body real payload before proceeding.
+        if (EnvelopeUtil.TryUnpack(payload, out var env, out var inner))
+        {
+            if ((env.flags & 0x08) != 0)
+            {
+                if (verboseNetLog) Debug.Log($"[Driver.Canary] full canary id={env.messageId} len={env.payloadLen}");
+                // canary full: do not decode as movement
+                return;
+            }
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] TargetPackedSnapshotTo envelope id={env.messageId} payloadLen={env.payloadLen} innerFirst8={BytesPreview(inner, 8)}");
+            // store metadata for diagnostic comparisons (server-provided)
+            try { _incomingEnvelopeMeta[env.messageId] = (env.payloadHash, env.payloadLen); } catch { }
+            payload = inner;
+        }
+        else
+        {
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] TargetPackedSnapshotTo raw first8={BytesPreview(payload, 8)} firstByte={(payload.Length > 0 ? payload[0] : 0)}");
+        }
+
         HandlePackedPayload(payload, stateHash);
     }
 
@@ -902,6 +1020,11 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     void TargetPackedShardTo(NetworkConnection conn, byte[] shard)
     {
         if (_shuttingDown || s_AppQuitting) return;
+
+        int slen = shard?.Length ?? 0;
+        if (verboseNetLog) Debug.Log($"[Driver.Debug] TargetPackedShardTo conn={conn?.ClientId} len={slen} first8={BytesPreview(shard, 8)} envelope={EnvelopeUtil.TryUnpack(shard, out var _, out var _)}");
+        if (shard == null || shard.Length < 8) { if (verboseNetLog) Debug.LogWarning($"[Driver] Ignoring too-small shard len={shard?.Length ?? 0}"); return; }
+
         HandlePackedShard(shard);
     }
 
@@ -921,10 +1044,6 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         // Note: to compute server expected we would need to map seq->hash store; approximate here by telemetry only
     }
 
-    // Client-side: partial shard buffering
-    private readonly List<ShardInfo> _shardBufferInfo = new();
-    private int _expectedShardCount = 0;
-
     // Internal helper to hold per-shard dataLen and bytes
     private class ShardInfo
     {
@@ -936,93 +1055,87 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 
     void HandlePackedShard(byte[] shard)
     {
-        // new header layout: total (ushort, 2) | index (ushort, 2) | dataLen (uint, 4) => header 8 bytes
-        if (shard == null || shard.Length < 8) return;
+        // Support: shard can be an Envelope that contains the payload shard
+        uint messageId = 0;
+        bool isCanary = false;
+        byte[] innerShard = shard;
+        if (EnvelopeUtil.TryUnpack(shard, out var env, out var inner))
+        {
+            innerShard = inner;
+            messageId = env.messageId;
+            isCanary = (env.flags & 0x08) != 0;
+            if (isCanary) _canaryMessageIds.Add(messageId);
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] HandlePackedShard envelope id={env.messageId} payloadLen={env.payloadLen} flags=0x{env.flags:X2} innerFirst8={BytesPreview(inner, 8)}");
+            // store server-provided envelope meta for diagnostics (hash & len)
+            try { _incomingEnvelopeMeta[env.messageId] = (env.payloadHash, env.payloadLen); } catch { }
+        }
+        else
+        {
+            if (verboseNetLog) Debug.Log($"[Driver.Debug] HandlePackedShard raw first8={BytesPreview(shard, 8)}");
+        }
 
-        ushort total = BitConverter.ToUInt16(shard, 0);
-        ushort idx = BitConverter.ToUInt16(shard, 2);
-        uint dataLenU = BitConverter.ToUInt32(shard, 4);
+        // validate minimal shard header
+        if (innerShard == null || innerShard.Length < 8) return;
+        ushort total = BitConverter.ToUInt16(innerShard, 0);
+        ushort idx = BitConverter.ToUInt16(innerShard, 2);
+        uint dataLenU = BitConverter.ToUInt32(innerShard, 4);
         int dataLen = (int)dataLenU;
-
-        if (dataLen < 0 || shard.Length < 8 + dataLen) return; // corrupted fragment
-
+        if (dataLen < 0 || innerShard.Length < 8 + dataLen) return;
         byte[] data = new byte[dataLen];
-        Array.Copy(shard, 8, data, 0, dataLen);
+        Array.Copy(innerShard, 8, data, 0, dataLen);
 
-        // initialize buffer info if first fragment
-        if (_shardBufferInfo.Count == 0)
+        // if messageId is zero (no envelope), synthesize a unique id per-time as fallback
+        if (messageId == 0)
         {
-            _shardBufferInfo.Clear();
-            for (int i = 0; i < total; i++) _shardBufferInfo.Add(null);
-            _expectedShardCount = total;
+            messageId = (uint)(DateTime.UtcNow.Ticks & 0xFFFFFFFF);
         }
 
-        if (idx < _shardBufferInfo.Count)
+        // ensure list exists
+        if (!_shardBuffers.TryGetValue(messageId, out var list))
         {
-            _shardBufferInfo[idx] = new ShardInfo { total = total, index = idx, dataLen = dataLen, data = data };
+            list = new List<ShardInfo>();
+            for (int i = 0; i < total; i++) list.Add(null);
+            _shardBuffers[messageId] = list;
+            _shardTotalCount[messageId] = total;
+            _shardFirstReceivedAt[messageId] = Time.realtimeSinceStartup;
         }
 
-        // check if all present (data != null)
+        // store shard
+        if (idx < list.Count)
+        {
+            list[idx] = new ShardInfo { total = total, index = idx, dataLen = dataLen, data = data };
+        }
+
+        _telemetry?.Increment("pack.shards_received");
+
+        // check completion
         bool all = true;
-        foreach (var s in _shardBufferInfo) { if (s == null) { all = false; break; } }
-        if (!all) return;
-
-        // At this point all data shards and parity shards may be present.
-        // Distinguish data shards count = total - parityCount (when parityCount known on server it's not sent; infer that parity exists if fecParityShards>0)
-        int totalShards = _shardBufferInfo.Count;
-        int parityCount = fecParityShards; // assume server and client agree
-        int dataShards = Math.Max(1, totalShards - parityCount);
-
-        // compute payload length (sum of dataLen of first dataShards)
-        long payloadLengthLong = 0;
-        for (int i = 0; i < dataShards; i++)
+        for (int i = 0; i < list.Count; ++i) { if (list[i] == null) { all = false; break; } }
+        if (!all)
         {
-            payloadLengthLong += _shardBufferInfo[i].dataLen;
-        }
-        if (payloadLengthLong > int.MaxValue) { _shardBufferInfo.Clear(); _expectedShardCount = 0; return; }
-        int payloadLength = (int)payloadLengthLong;
-
-        // allocate payload and copy data shards in order using their dataLen
-        byte[] payload = new byte[payloadLength];
-        int writePos = 0;
-        for (int i = 0; i < dataShards; i++)
-        {
-            var sin = _shardBufferInfo[i];
-            Array.Copy(sin.data, 0, payload, writePos, sin.dataLen);
-            writePos += sin.dataLen;
-        }
-
-        // If some data shards are missing but parity can recover, attempt simple XOR recovery:
-        bool missingDataShard = false;
-        for (int i = 0; i < dataShards; i++) if (_shardBufferInfo[i] == null) missingDataShard = true;
-        if (missingDataShard && parityCount > 0)
-        {
-            // Simple XOR parity recovery supports single-missing for the naive parity scheme we use.
-            // Build padded dataShards (pad each to shardSize) for XOR parity calculation.
-            int shardPadSize = fecShardSize;
-            byte[][] padded = new byte[totalShards][];
-            for (int i = 0; i < totalShards; i++)
+            // attempt parity recovery if only one data shard missing and parity present
+            int totalShards = list.Count;
+            int parityCount = fecParityShards;
+            int dataShards = Math.Max(1, totalShards - parityCount);
+            int missingDataIdx = -1;
+            int missingCount = 0;
+            for (int i = 0; i < dataShards; ++i) if (list[i] == null) { missingDataIdx = i; missingCount++; }
+            if (missingCount == 1 && parityCount > 0)
             {
-                var sInfo = _shardBufferInfo[i];
-                if (sInfo != null)
+                // recover single missing using XOR parity
+                int shardPadSize = fecShardSize;
+                byte[][] padded = new byte[totalShards][];
+                for (int i = 0; i < totalShards; i++)
                 {
-                    padded[i] = new byte[shardPadSize];
-                    Array.Clear(padded[i], 0, shardPadSize);
-                    Array.Copy(sInfo.data, 0, padded[i], 0, sInfo.dataLen);
+                    var sInfo = list[i];
+                    if (sInfo != null)
+                    {
+                        padded[i] = new byte[shardPadSize];
+                        Array.Clear(padded[i], 0, shardPadSize);
+                        Array.Copy(sInfo.data, 0, padded[i], 0, Math.Min(sInfo.dataLen, shardPadSize));
+                    }
+                    else padded[i] = new byte[shardPadSize];
                 }
-                else
-                {
-                    padded[i] = new byte[shardPadSize];
-                    Array.Clear(padded[i], 0, shardPadSize);
-                }
-            }
-
-            // find missing index among data shards
-            int missIdx = -1;
-            for (int i = 0; i < dataShards; i++) if (_shardBufferInfo[i] == null) { missIdx = i; break; }
-            if (missIdx >= 0)
-            {
-                // XOR across all shards (including parity) to recover missing padded shard
                 byte[] recovered = new byte[shardPadSize];
                 Array.Clear(recovered, 0, shardPadSize);
                 for (int s = 0; s < totalShards; s++)
@@ -1030,46 +1143,108 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
                     var p = padded[s];
                     for (int b = 0; b < shardPadSize; b++) recovered[b] ^= p[b];
                 }
-
-                // determine actual data length for recovered shard: for interior shards it's shardPadSize except last data shard which may be shorter.
                 int recoveredDataLen = shardPadSize;
-                if (missIdx == dataShards - 1)
+                if (missingDataIdx == dataShards - 1)
                 {
-                    // last data shard may be shorter: compute based on payloadLength and previous shards
                     int sumPrev = 0;
-                    for (int i = 0; i < missIdx; i++) sumPrev += _shardBufferInfo[i].dataLen;
-                    recoveredDataLen = payloadLength - sumPrev;
-                    if (recoveredDataLen < 0) recoveredDataLen = 0;
+                    for (int i = 0; i < missingDataIdx; i++) sumPrev += list[i].dataLen;
+                    // best-effort: clamp
+                    recoveredDataLen = Math.Min(recoveredDataLen, shardPadSize);
                 }
-
                 byte[] recData = new byte[recoveredDataLen];
                 Array.Copy(recovered, 0, recData, 0, recoveredDataLen);
-
-                // place recovered data into payload at correct position
-                int recWritePos = 0;
-                for (int i = 0; i < missIdx; i++) recWritePos += _shardBufferInfo[i].dataLen;
-                Array.Copy(recData, 0, payload, recWritePos, recoveredDataLen);
-
-                // mark recovered shard as present to keep consistent cleanup
-                _shardBufferInfo[missIdx] = new ShardInfo { total = (ushort)totalShards, index = (ushort)missIdx, dataLen = recoveredDataLen, data = recData };
+                list[missingDataIdx] = new ShardInfo { total = (ushort)total, index = (ushort)missingDataIdx, dataLen = recoveredDataLen, data = recData };
+                _telemetry?.Increment("pack.shards_recovered");
             }
             else
             {
-                // multiple missing data shards; cannot recover with single parity.
-                // fallback: clear buffer and request full from server.
-                _shardBufferInfo.Clear();
-                _expectedShardCount = 0;
-                RequestFullSnapshotFromServer();
+                // not yet complete
                 return;
             }
         }
 
-        // At this point payload should be complete
+        // assemble payload from data shards (first dataShards are data)
+        int totalShardsFinal = _shardTotalCount[messageId];
+        int parityCnt = fecParityShards;
+        int dataCount = Math.Max(1, totalShardsFinal - parityCnt);
+        long payloadLengthLong = 0;
+        for (int i = 0; i < dataCount; i++) payloadLengthLong += list[i].dataLen;
+        if (payloadLengthLong > int.MaxValue) { CleanupShardBuffer(messageId); return; }
+        int payloadLength = (int)payloadLengthLong;
+        byte[] payload = new byte[payloadLength];
+        int writePos = 0;
+        for (int i = 0; i < dataCount; i++)
+        {
+            var sInfo = list[i];
+            Array.Copy(sInfo.data, 0, payload, writePos, sInfo.dataLen);
+            writePos += sInfo.dataLen;
+        }
+
+        // Diagnostic: compute hash and compare with server-provided if available
+        try
+        {
+            ulong computed = EnvelopeUtil.ComputeHash64(payload);
+            if (_incomingEnvelopeMeta.TryGetValue(messageId, out var meta))
+            {
+                if (computed != meta.hash || payloadLength != meta.len)
+                {
+                    Debug.LogWarning($"[Driver.Warning] Hash/len mismatch for messageId={messageId} computedHash=0x{computed:X16} serverHash=0x{meta.hash:X16} computedLen={payloadLength} serverLen={meta.len}");
+                }
+                else if (verboseNetLog)
+                {
+                    Debug.Log($"[Driver.Debug] Reassembled payload ok id={messageId} len={payloadLength} hash=0x{computed:X16}");
+                }
+            }
+            else if (verboseNetLog)
+            {
+                Debug.Log($"[Driver.Debug] Reassembled payload id={messageId} len={payloadLength} computedHash=0x{computed:X16} (no server meta)");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Driver.Debug] Exception computing hash for reassembled payload messageId={messageId}: {ex.Message}");
+        }
+
+        // success: hand off to payload handler (which will run PackedMovement.TryUnpack and log CRC mismatches)
+        if (_canaryMessageIds.Contains(messageId))
+        {
+            if (verboseNetLog) Debug.Log($"[Driver.Canary] reassembled canary payload id={messageId} len={payloadLength} — drop");
+            CleanupShardBuffer(messageId);
+            _incomingEnvelopeMeta.Remove(messageId);
+            _canaryMessageIds.Remove(messageId);
+            return; // do not decode as movement
+        }
+
         HandlePackedPayload(payload, ComputeStateHashFromPayload(payload));
 
         // cleanup
-        _shardBufferInfo.Clear();
-        _expectedShardCount = 0;
+        CleanupShardBuffer(messageId);
+        _incomingEnvelopeMeta.Remove(messageId);
+    }
+
+    void CleanupShardBuffer(uint messageId)
+    {
+        _shardBuffers.Remove(messageId);
+        _shardTotalCount.Remove(messageId);
+        _shardFirstReceivedAt.Remove(messageId);
+    }
+
+    void CheckShardBufferTimeouts()
+    {
+        var now = Time.realtimeSinceStartup;
+        var expired = new List<uint>();
+        foreach (var kv in _shardFirstReceivedAt)
+        {
+            if (now - kv.Value > SHARD_BUFFER_TIMEOUT_SECONDS) expired.Add(kv.Key);
+        }
+        foreach (var id in expired)
+        {
+            _telemetry?.Increment("pack.shards_timeout");
+            RequestFullSnapshotFromServer();
+            CleanupShardBuffer(id);
+            _incomingEnvelopeMeta.Remove(id);
+            _canaryMessageIds.Remove(id);
+        }
     }
 
     void HandlePackedPayload(byte[] payload)
@@ -1165,14 +1340,26 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         {
             var shards = BuildFecShards(full, fecShardSize, fecParityShards);
             _lastFullShards[conn] = shards;
-            foreach (var s in shards) TargetPackedShardTo(conn, s);
+            ulong fullHash = EnvelopeUtil.ComputeHash64(full);
+            int fullLen = full.Length;
+            uint messageId = _nextOutgoingMessageId++;
+
+            if (verboseNetLog) Debug.Log($"[Server.Debug] RequestFullSnapshotServerRpc sending shards messageId={messageId} fullLen={fullLen} fullHash=0x{fullHash:X16} totalShards={shards.Count}");
+            foreach (var s in shards)
+            {
+                if (verboseNetLog) Debug.Log($"[Server.Debug] Shard idx? shardLen={s.Length} first8={BytesPreview(s, 8)}");
+                byte[] envelopeBytes = CreateEnvelopeBytesForShard(s, messageId, fullLen, fullHash);
+                TargetPackedShardTo(conn, envelopeBytes);
+            }
         }
         else
         {
             _lastFullPayload[conn] = full;
             _lastFullSentAt[conn] = _netTime.Now();
             _fullRetryCount[conn] = 0;
-            TargetPackedSnapshotTo(conn, full, stateHash);
+
+            byte[] fullEnv = CreateEnvelopeBytes(full);
+            TargetPackedSnapshotTo(conn, fullEnv, stateHash);
         }
         _telemetry?.Increment($"client.{OwnerClientId}.full_requested_by_client");
     }
@@ -1221,14 +1408,17 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
         var shards = new List<byte[]>();
         if (payload == null || payload.Length == 0) return shards;
 
-        int dataShards = (payload.Length + shardSize - 1) / shardSize;
+        // Clamp shard size to payload length if payload is smaller than configured shardSize.
+        int effectiveShardSize = Math.Min(shardSize, Math.Max(1, payload.Length));
+
+        int dataShards = (payload.Length + effectiveShardSize - 1) / effectiveShardSize;
         int totalShards = dataShards + parityCount;
 
         // create data shards (last shard may be short)
         for (int i = 0; i < dataShards; i++)
         {
-            int start = i * shardSize;
-            int len = Math.Min(shardSize, payload.Length - start);
+            int start = i * effectiveShardSize;
+            int len = Math.Min(effectiveShardSize, payload.Length - start);
             // header: total (ushort) | index (ushort) | dataLen (uint)
             byte[] s = new byte[2 + 2 + 4 + len];
             Array.Copy(BitConverter.GetBytes((ushort)totalShards), 0, s, 0, 2);
@@ -1238,15 +1428,14 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
             shards.Add(s);
         }
 
-        // create parity shards by XORing padded data shards (pad to shardSize for parity calculation)
+        // create parity shards by XORing padded data shards (pad to effectiveShardSize for parity calculation)
         for (int p = 0; p < parityCount; p++)
         {
-            int maxLen = shardSize;
+            int maxLen = effectiveShardSize;
             byte[] parityPayload = new byte[maxLen];
             Array.Clear(parityPayload, 0, maxLen);
             for (int i = 0; i < dataShards; i++)
             {
-                int dataStart = 8; // in shards[i] actual data offset
                 int dsLen = shards[i].Length - 8;
                 for (int b = 0; b < maxLen; b++)
                 {
@@ -1451,23 +1640,54 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     }
 
     // ------- PUBLIC WRAPPERS (for external hooks/helpers) -------
-    // expose minimal public wrappers so external helpers (Canary, Hooks) can call into driver without accessing privates
-
-    // Public wrapper to allow external callers to forward raw shard bytes
     public void HandlePackedShardPublic(byte[] shard)
     {
         HandlePackedShard(shard);
     }
 
-    // Public wrapper to send a packed snapshot envelope to a specific client connection
     public void SendPackedSnapshotToClient(NetworkConnection conn, byte[] packedEnvelope, ulong stateHash)
     {
         TargetPackedSnapshotTo(conn, packedEnvelope, stateHash);
     }
 
-    // Public wrapper to send a packed shard envelope to a specific client connection
     public void SendPackedShardToClient(NetworkConnection conn, byte[] packedShard)
     {
         TargetPackedShardTo(conn, packedShard);
+    }
+
+    // debug helper: preview primi N byte in hex
+    static string BytesPreview(byte[] b, int n)
+    {
+        if (b == null || b.Length == 0) return "(null)";
+        int m = Math.Min(n, b.Length);
+        var sb = new System.Text.StringBuilder();
+        for (int i = 0; i < m; ++i) sb.AppendFormat("{0:X2}", b[i]);
+        if (b.Length > m) sb.Append("..");
+        return sb.ToString();
+    }
+
+    // Helper: create an envelope byte[] with proper header fields filled (for single full/delta payloads)
+    byte[] CreateEnvelopeBytes(byte[] payload)
+    {
+        var env = new Envelope();
+        env.messageId = _nextOutgoingMessageId++;
+        env.seq = _lastSeqSent;
+        env.payloadLen = payload != null ? payload.Length : 0;
+        env.payloadHash = EnvelopeUtil.ComputeHash64(payload);
+        env.flags = 0;
+        return EnvelopeUtil.Pack(env, payload);
+    }
+
+    // Helper: create an envelope for a shard but attach message-level metadata (full payload len/hash) for reassembly verification
+    byte[] CreateEnvelopeBytesForShard(byte[] shard, uint messageId, int fullPayloadLen, ulong fullPayloadHash)
+    {
+        var env = new Envelope();
+        env.messageId = messageId;
+        env.seq = _lastSeqSent;
+        // IMPORTANT: payloadLen/payloadHash here refer to the full payload (not the single shard)
+        env.payloadLen = fullPayloadLen;
+        env.payloadHash = fullPayloadHash;
+        env.flags = 0; // not canary, regular gameplay shard wrapper
+        return EnvelopeUtil.Pack(env, shard);
     }
 }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -14,103 +14,153 @@ public class CanaryTest : NetworkBehaviour
     public int parity = 1;
     public float intervalSec = 2.0f;
     public bool autoRun = false;
-    public bool useShards = true;
+    public bool sendAsShards = true; // true = shards+parity, false = singolo full
 
     private byte[] _canaryPayload;
+    private float _timer;
 
     void Awake()
     {
-        _canaryPayload = BuildCanary(canaryLen);
+        BuildPayload();
+    }
+
+#if UNITY_EDITOR
+    // Evita l'avviso CS0114: adesso stiamo override-ando quello di NetworkBehaviour
+    protected override void OnValidate()
+    {
+        base.OnValidate();
+
+        canaryLen = Mathf.Max(1, canaryLen);
+        shardSize = Mathf.Max(1, shardSize);
+        parity = Mathf.Max(0, parity);
+    }
+#endif
+
+    void BuildPayload()
+    {
+        _canaryPayload = new byte[Mathf.Max(1, canaryLen)];
+        for (int i = 0; i < _canaryPayload.Length; i++)
+            _canaryPayload[i] = (byte)(i & 0xFF);
     }
 
     public override void OnStartServer()
     {
         base.OnStartServer();
-        if (autoRun) InvokeRepeating(nameof(RunCanaryAll), 1f, intervalSec);
+        _timer = 0f;
     }
 
-    void RunCanaryAll()
+    void Update()
     {
-        // InstanceFinder.ServerManager.Clients is a dictionary-like container; iterate its Values
-        var clientsDict = InstanceFinder.ServerManager.Clients;
-        if (clientsDict == null) return;
+        // fix CS0618: usa IsServerInitialized invece di IsServer
+        if (!IsServerInitialized)
+            return;
 
-        foreach (var kv in clientsDict)
+        if (!autoRun)
+            return;
+
+        _timer += Time.deltaTime;
+        if (_timer >= intervalSec)
         {
-            var client = kv.Value;
-            if (client == null) continue;
-            SendCanaryTo(client.ClientId, useShards);
+            _timer = 0f;
+            BroadcastOnce(sendAsShards);
         }
     }
 
-    public static byte[] BuildCanary(int len)
+    [ContextMenu("Canary → Broadcast FULL once")]
+    public void BroadcastFullOnce()
     {
-        var b = new byte[len];
-        for (int i = 0; i < len; ++i) b[i] = (byte)(i & 0xFF);
-        return b;
+        BroadcastOnce(false);
     }
 
-    public void SendCanaryTo(int clientId, bool shards)
+    [ContextMenu("Canary → Broadcast SHARDS once")]
+    public void BroadcastShardsOnce()
     {
-        var clientsDict = InstanceFinder.ServerManager.Clients;
-        if (clientsDict == null) return;
+        BroadcastOnce(true);
+    }
 
-        if (!clientsDict.TryGetValue(clientId, out var conn)) return;
-        if (conn == null) return;
+    void BroadcastOnce(bool shards)
+    {
+        // fix CS0618 anche qui
+        if (!IsServerInitialized)
+            return;
 
+        if (_canaryPayload == null || _canaryPayload.Length == 0)
+            BuildPayload();
+
+        var clients = InstanceFinder.ServerManager?.Clients;
+        if (clients == null)
+            return;
+
+        foreach (var kv in clients)
+        {
+            var conn = kv.Value;
+            if (conn == null || !conn.IsActive)
+                continue;
+
+            SendCanaryTo(conn, shards);
+        }
+    }
+
+    void SendCanaryTo(NetworkConnection conn, bool shards)
+    {
         var driver = UnityEngine.Object.FindObjectOfType<PlayerNetworkDriverFishNet>();
-        if (driver == null) return;
-
-        if (shards)
+        if (driver == null)
         {
-            var sList = FecReedSolomon.BuildShards(_canaryPayload, shardSize, parity);
-            foreach (var s in sList)
-            {
-                Envelope env = new Envelope { messageId = 0xC0FFEE, seq = (uint)Environment.TickCount, payloadLen = s.Length, payloadHash = EnvelopeUtil.ComputeHash64(s), flags = 0x4 };
-                var packed = EnvelopeUtil.Pack(env, s);
-                driver.SendPackedShardToClient(conn, packed);
-            }
-        }
-        else
-        {
-            Envelope env = new Envelope { messageId = 0xC0FFEE, seq = (uint)Environment.TickCount, payloadLen = _canaryPayload.Length, payloadHash = EnvelopeUtil.ComputeHash64(_canaryPayload), flags = 0x8 | 0x1 };
-            var packed = EnvelopeUtil.Pack(env, _canaryPayload);
-            driver.SendPackedSnapshotToClient(conn, packed, EnvelopeUtil.ComputeHash64(_canaryPayload));
-        }
-    }
-
-    [TargetRpc]
-    void TargetReceiveBytes(NetworkConnection conn, byte[] bytes)
-    {
-        if (!EnvelopeUtil.TryUnpack(bytes, out var env, out var payload)) return;
-
-        if ((env.flags & 0x4) != 0) // shard
-        {
-            var driver = UnityEngine.Object.FindObjectOfType<PlayerNetworkDriverFishNet>();
-            if (driver != null) driver.HandlePackedShardPublic(payload);
+            Debug.LogWarning("[Canary] PlayerNetworkDriverFishNet non trovato.");
             return;
         }
 
-        if ((env.flags & 0x8) != 0) // canary full
-        {
-            bool ok = CheckCanary(payload);
-            ServerReportCanaryResult(conn, env.seq, ok, payload?.Length ?? 0);
-        }
-    }
+        // useremo sempre lo stesso messageId così il client può riconoscere “è canary”
+        const uint messageId = 0xC0FFEEu;
+        uint seq = unchecked((uint)Environment.TickCount);
 
-    [ServerRpc(RequireOwnership = false)]
-    void ServerReportCanaryResult(NetworkConnection who, uint seq, bool ok, int len)
-    {
-        Debug.Log($"[Canary] client {who.ClientId} seq={seq} ok={ok} len={len}");
-    }
-
-    static bool CheckCanary(byte[] payload)
-    {
-        if (payload == null) return false;
-        for (int i = 0; i < payload.Length; ++i)
+        if (!shards || parity <= 0)
         {
-            if (payload[i] != (byte)(i & 0xFF)) return false;
+            // FULL payload in un unico envelope
+            ulong fullHash = EnvelopeUtil.ComputeHash64(_canaryPayload);
+
+            var env = new Envelope
+            {
+                messageId = messageId,
+                seq = seq,
+                payloadLen = _canaryPayload.Length,
+                payloadHash = fullHash,
+                flags = 0x08 // 0x08 = canary full
+            };
+
+            byte[] packed = EnvelopeUtil.Pack(env, _canaryPayload);
+
+            // manda come se fosse un normale snapshot (ma il driver lo marchia come canary e NON tenta di decodificarlo come movement)
+            driver.SendPackedSnapshotToClient(conn, packed, fullHash);
+
+            Debug.Log($"[Canary] FULL sent to {conn.ClientId}, len={_canaryPayload.Length} hash=0x{fullHash:X16}");
+            return;
         }
-        return true;
+
+        // SHARDS + parity: ogni shard porta i metadati della snapshot INTERA.
+        var shardsList = FecReedSolomon.BuildShards(_canaryPayload, shardSize, parity);
+
+        ulong fullHash2 = EnvelopeUtil.ComputeHash64(_canaryPayload);
+        int fullLen2 = _canaryPayload.Length;
+
+        for (int i = 0; i < shardsList.Count; i++)
+        {
+            var s = shardsList[i];
+
+            var envShard = new Envelope
+            {
+                messageId = messageId,
+                seq = seq,
+                payloadLen = fullLen2,   // lunghezza TOTALE della snapshot completa
+                payloadHash = fullHash2, // hash TOTALE della snapshot completa
+                flags = 0x04 | 0x08      // 0x04 = shard, 0x08 = canary
+            };
+
+            byte[] packedShard = EnvelopeUtil.Pack(envShard, s);
+
+            driver.SendPackedShardToClient(conn, packedShard);
+        }
+
+        Debug.Log($"[Canary] SHARDS sent to {conn.ClientId}, totalShards={shardsList.Count} fullLen={fullLen2}");
     }
 }
