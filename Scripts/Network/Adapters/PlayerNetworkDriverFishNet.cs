@@ -14,6 +14,11 @@ using UnityEngine.AI;
 [RequireComponent(typeof(Rigidbody))]
 public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
 {
+    [Header("Diagnostics")]
+    [Tooltip("If false, CRC mismatch warnings are suppressed at runtime (kept in Editor/Dev builds).")]
+    public bool enableCrcWarnings = false;
+
+
     // ---- Quit guard (no RPC during shutdown) ----
     private static bool s_AppQuitting = false;
     private static void OnAppQuit() => s_AppQuitting = true;
@@ -1604,6 +1609,13 @@ public class PlayerNetworkDriverFishNet : NetworkBehaviour, IPlayerNetworkDriver
     // ------- CRC reporting helper (rate-limited, non-blocking) -------
     private void ReportCrcFailureOncePerWindow(string msg)
     {
+        // [BOOKMARK B - CRC WARNINGS GATE]
+#if !UNITY_EDITOR && !DEVELOPMENT_BUILD
+        if (!enableCrcWarnings) return;
+#else
+        if (!enableCrcWarnings) return;
+#endif
+
         double now = Time.realtimeSinceStartup;
         if (_crcFirstFailTime < 0.0) _crcFirstFailTime = now;
 

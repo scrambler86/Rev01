@@ -53,6 +53,9 @@ public class PlayerControllerCore : MonoBehaviour
     float _lastPlanarSpeed;
     RaycastHit[] _groundBuffer;
 
+    // evita di ruotare il root (che trascina la camera) se non abbiamo un visual child separato
+    bool _canRotateVisualRoot = true;
+
     public bool IsRunning => _runToggle;
     public Vector3 DebugLastMoveDir => _lastMoveDir;
     public Transform VisualRoot => visualRoot;
@@ -98,12 +101,20 @@ public class PlayerControllerCore : MonoBehaviour
             Transform t = transform.Find(visualChildName);
             if (t) visualRoot = t;
         }
-        if (!visualRoot) visualRoot = transform;
+        if (!visualRoot)
+            visualRoot = transform;
+
+        // <-- questa è la protezione anti-"mi gira tutta la mappa"
+        _canRotateVisualRoot = (visualRoot != transform);
 
         Vector3 p = transform.position;
         p = SnapToGround(p);
         _rb.position = p;
-        if (_agent) { _agent.Warp(p); _agent.nextPosition = p; }
+        if (_agent)
+        {
+            _agent.Warp(p);
+            _agent.nextPosition = p;
+        }
 
         _lastMoveDir = Vector3.zero;
         _lastPlanarSpeed = 0f;
@@ -114,6 +125,7 @@ public class PlayerControllerCore : MonoBehaviour
         if (!mainCamera) mainCamera = Camera.main;
         if (!terrain) terrain = Terrain.activeTerrain;
 
+        // shift toggle run ON/OFF (tua logica originale)
         if (_allowInput && (Input.GetKeyDown(KeyCode.LeftShift) || Input.GetKeyDown(KeyCode.RightShift)))
             _runToggle = !_runToggle;
     }
@@ -138,7 +150,8 @@ public class PlayerControllerCore : MonoBehaviour
         if (Mathf.Abs(hz) < 0.2f) hz = 0f;
         if (Mathf.Abs(vt) < 0.2f) vt = 0f;
         Vector3 inputRaw = new Vector3(hz, 0f, vt);
-        if (inputRaw.sqrMagnitude > 1f) inputRaw.Normalize();
+        if (inputRaw.sqrMagnitude > 1f)
+            inputRaw.Normalize();
 
         bool wasdPressed =
             Input.GetKey(KeyCode.W) || Input.GetKey(KeyCode.A) ||
@@ -176,7 +189,9 @@ public class PlayerControllerCore : MonoBehaviour
         {
             desiredDir = inputRaw;
             if (mainCamera)
+            {
                 desiredDir = (Quaternion.Euler(0f, mainCamera.transform.eulerAngles.y, 0f) * desiredDir).normalized;
+            }
         }
 
         if (desiredDir.sqrMagnitude < 0.0001f)
@@ -196,11 +211,17 @@ public class PlayerControllerCore : MonoBehaviour
         if (constrainWASDToNavMesh && !usingCTM)
         {
             if (NavMesh.Raycast(_rb.position, target, out var rh, NavMesh.AllAreas))
+            {
                 target = rh.position;
+            }
             else if (NavMesh.SamplePosition(target, out var nh, navClampMaxDistance, NavMesh.AllAreas))
+            {
                 target = nh.position;
+            }
             else
+            {
                 target = _rb.position;
+            }
         }
 
         float planarSpeed = (target - _rb.position).magnitude / Time.fixedDeltaTime;
@@ -210,12 +231,22 @@ public class PlayerControllerCore : MonoBehaviour
         _rb.MovePosition(target);
         if (_agent) _agent.nextPosition = target;
 
-        if (visualRoot)
+        if (_canRotateVisualRoot && visualRoot)
         {
             Quaternion q = Quaternion.LookRotation(desiredDir);
-            visualRoot.rotation = Quaternion.Slerp(visualRoot.rotation, q, Time.fixedDeltaTime * 12f);
+            visualRoot.rotation = Quaternion.Slerp(
+                visualRoot.rotation,
+                q,
+                Time.fixedDeltaTime * 12f
+            );
             if (forceUprightVisual)
-                visualRoot.rotation = Quaternion.Euler(0f, visualRoot.eulerAngles.y, 0f);
+            {
+                visualRoot.rotation = Quaternion.Euler(
+                    0f,
+                    visualRoot.eulerAngles.y,
+                    0f
+                );
+            }
         }
 
         SafeAnimSpeedRaw(animSpeed);
@@ -261,8 +292,11 @@ public class PlayerControllerCore : MonoBehaviour
 
         RaycastHit[] hits = _groundBuffer ??= new RaycastHit[6];
         int count = Physics.RaycastNonAlloc(
-            origin, Vector3.down, hits,
-            half + groundProbeExtra + 2f, walkableMask,
+            origin,
+            Vector3.down,
+            hits,
+            half + groundProbeExtra + 2f,
+            walkableMask,
             QueryTriggerInteraction.Ignore
         );
 
@@ -273,8 +307,10 @@ public class PlayerControllerCore : MonoBehaviour
         for (int i = 0; i < count; i++)
         {
             var h = hits[i];
-            if (!h.collider || h.collider.transform.IsChildOf(transform)) continue;
-            if (h.point.y > maxY) continue;
+            if (!h.collider || h.collider.transform.IsChildOf(transform))
+                continue;
+            if (h.point.y > maxY)
+                continue;
 
             if (h.point.y > bestY)
             {
@@ -302,13 +338,15 @@ public class PlayerControllerCore : MonoBehaviour
     public void SetAllowInput(bool allow)
     {
         _allowInput = allow;
-        if (!allow) StopMovement();
+        if (!allow)
+            StopMovement();
     }
 
     public void SetCanMove(bool can)
     {
         canMove = can;
-        if (!can) StopMovement();
+        if (!can)
+            StopMovement();
     }
 
     void IdleAnim()
@@ -338,11 +376,13 @@ public class PlayerControllerCore : MonoBehaviour
 
     public void SafeAnimSpeedRaw(float v)
     {
-        if (_anim != null && _hasAnimSpeed) _anim.SetFloat(animSpeedParam, v);
+        if (_anim != null && _hasAnimSpeed)
+            _anim.SetFloat(animSpeedParam, v);
     }
 
     public void SafeAnimRun(bool v)
     {
-        if (_anim != null && _hasAnimRun) _anim.SetBool(animRunBoolParam, v);
+        if (_anim != null && _hasAnimRun)
+            _anim.SetBool(animRunBoolParam, v);
     }
 }

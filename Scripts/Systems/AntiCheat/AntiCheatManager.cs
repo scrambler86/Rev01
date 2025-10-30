@@ -1,64 +1,84 @@
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.AI;
 
 /// <summary>
-/// AntiCheatManager avanzato:
-/// - soft-fails come prima
-/// - cheap-sim server-side (opzionale) per verifiche aggiuntive
-/// - escalation automatica via Telemetry counters
+/// Validatore server-side degli input movimento del client.
+/// Ritorna true se l'input sembra legittimo, false se è sospetto.
+/// Viene chiamato da PlayerNetworkDriverFishNet.CmdSendInput().
 /// </summary>
 public class AntiCheatManager : MonoBehaviour, IAntiCheatValidator
 {
     [Header("Switches")]
+    [Tooltip("Controlla la distanza planare massima percorsa in 1 tick.")]
     public bool enableMaxStepCheck = true;
-    public bool enableNavMeshCheck = false;
-    public bool enableVerticalClamp = false;
-    public bool enableStateCheck = false;
-    public bool debugLogs = false;
 
-    [Header("Vertical")]
-    public float maxVerticalSpeed = 4.0f;
+    [Tooltip("Verifica che la posizione proposta sia ancora su NavMesh.")]
+    public bool enableNavMeshCheck = true;
 
-    [Header("NavMesh")]
+    [Tooltip("Blocca spike verticali esagerati (salti/voli istantanei).")]
+    public bool enableVerticalClamp = true;
+
+    [Tooltip("Controllo extra di velocità massima simulata lato server (un po' più costoso).")]
+    public bool enableCheapSim = false;
+
+    [Tooltip("Logga warning quando falliscono i check.")]
+    public bool debugLogs = true;
+
+    [Header("Limits")]
+    [Tooltip("raggio di sample NavMesh.SamplePosition, metri.")]
     public float navMeshSampleDist = 1.0f;
 
-    [Header("Escalation")]
-    public int maxSoftFailsBeforeQuarantine = 6;
-    public float quarantineSeconds = 8f;
-    public int maxSoftFailsBeforeWarning = 3;
+    [Tooltip("velocità verticale massima consentita (m/s).")]
+    public float maxVerticalSpeed = 2.0f;
 
-    [Header("CheapSim")]
-    public bool enableCheapSim = true;
-    public float cheapSimTolerance = 0.5f; // metri
+    [Tooltip("quanti soft-fail prima di avvisare in log.")]
+    public int maxSoftFailsBeforeWarning = 30;
 
-    private TelemetryManager _telemetry;
+    [Tooltip("quanti soft-fail prima di segnalare quarantena/kick.")]
+    public int maxSoftFailsBeforeQuarantine = 80;
 
-    void Awake()
-    {
-        _telemetry = FindObjectOfType<TelemetryManager>();
-    }
+    [Header("Telemetry (optional)")]
+    public TelemetryManager telemetry;
 
-    public virtual bool IsMovementAllowed(IPlayerNetworkDriver drv) => true;
+    // conteggio dei soft-fail per clientId
+    private readonly Dictionary<int, int> _softFailCounts = new Dictionary<int, int>();
 
+    // =====================================================================
+    // 1) Metodo richiesto dall'interfaccia IAntiCheatValidator
+    // =====================================================================
     public bool ValidateInput(
         IPlayerNetworkDriver drv,
         uint seq,
-        double timestampClient,
+        double timestamp,
         Vector3 predictedPos,
         Vector3 lastServerPos,
         float maxStepAllowance,
         Vector3[] pathCorners,
         bool running)
     {
-        const float dtFallback = 1f / 30f;
-        return ValidateInput(drv, seq, timestampClient, predictedPos, lastServerPos,
-                             maxStepAllowance, pathCorners, running, dtFallback);
+        // fallback: usiamo Time.fixedDeltaTime come dt lato server
+        float dtServer = Time.fixedDeltaTime;
+        return ValidateInputInternal(
+            drv,
+            seq,
+            timestamp,
+            predictedPos,
+            lastServerPos,
+            maxStepAllowance,
+            pathCorners,
+            running,
+            dtServer
+        );
     }
 
+    // =====================================================================
+    // 2) Overload usato dal tuo driver quando può passare anche dtServer
+    // =====================================================================
     public bool ValidateInput(
-        IPlayerNetworkDriver drv,
+        PlayerNetworkDriverFishNet drv,
         uint seq,
-        double timestampClient,
+        double timestamp,
         Vector3 predictedPos,
         Vector3 lastServerPos,
         float maxStepAllowance,
@@ -66,106 +86,121 @@ public class AntiCheatManager : MonoBehaviour, IAntiCheatValidator
         bool running,
         float dtServer)
     {
-        // 0) State
-        if (enableStateCheck && !IsMovementAllowed(drv))
-        {
-            MarkSuspicious(drv, seq, "state-blocked");
-            if (debugLogs) Debug.LogWarning($"[AC] Suspicious seq={seq} state-blocked");
-            return false;
-        }
+        return ValidateInputInternal(
+            drv,
+            seq,
+            timestamp,
+            predictedPos,
+            lastServerPos,
+            maxStepAllowance,
+            pathCorners,
+            running,
+            dtServer
+        );
+    }
 
-        // 1) Max step
+    // =====================================================================
+    // 3) Logica vera dei controlli, basata su IPlayerNetworkDriver
+    // =====================================================================
+    private bool ValidateInputInternal(
+        IPlayerNetworkDriver drv,
+        uint seq,
+        double timestamp,
+        Vector3 predictedPos,
+        Vector3 lastServerPos,
+        float maxStepAllowance,
+        Vector3[] pathCorners,
+        bool running,
+        float dtServer)
+    {
+        bool ok = true;
+
+        // ricava PlayerControllerCore per velocità consentita
+        PlayerControllerCore core = null;
+        MonoBehaviour mb = drv as MonoBehaviour;
+        if (mb != null)
+            core = mb.GetComponent<PlayerControllerCore>();
+
+        float baseSpeed = core ? core.speed : 3.5f;
+        float runMul = core ? core.runMultiplier : 1.6f;
+        float allowedSpeed = running ? baseSpeed * runMul : baseSpeed;
+
+        // 1) distanza planare massima per tick
         if (enableMaxStepCheck)
         {
-            float dist = Vector2.Distance(
-                new Vector2(predictedPos.x, predictedPos.z),
-                new Vector2(lastServerPos.x, lastServerPos.z));
+            Vector2 a = new Vector2(predictedPos.x, predictedPos.z);
+            Vector2 b = new Vector2(lastServerPos.x, lastServerPos.z);
+            float planarDist = Vector2.Distance(a, b);
 
-            if (dist > maxStepAllowance)
+            if (planarDist > maxStepAllowance + 0.001f)
             {
-                MarkSuspicious(drv, seq, $"step dist={dist:0.###} > {maxStepAllowance:0.###}");
-                if (debugLogs) Debug.LogWarning($"[AC] Suspicious seq={seq} step dist={dist:0.###} > {maxStepAllowance:0.###}");
-                return false;
+                ok = false;
+                if (debugLogs)
+                    Debug.LogWarning($"[AC] client={drv?.OwnerClientId} seq={seq} planarDist={planarDist:0.###} > maxStep={maxStepAllowance:0.###}");
             }
         }
 
-        // 2) NavMesh
-        if (enableNavMeshCheck)
+        // 2) validità NavMesh
+        if (ok && enableNavMeshCheck)
         {
-            if (!NavMesh.SamplePosition(predictedPos, out _, navMeshSampleDist, NavMesh.AllAreas))
+            if (!NavMesh.SamplePosition(predictedPos, out NavMeshHit nh, navMeshSampleDist, NavMesh.AllAreas))
             {
-                MarkSuspicious(drv, seq, "off-mesh");
-                if (debugLogs) Debug.LogWarning($"[AC] Suspicious seq={seq} off-mesh");
-                return false;
+                ok = false;
+                if (debugLogs)
+                    Debug.LogWarning($"[AC] client={drv?.OwnerClientId} seq={seq} off-NavMesh pos={predictedPos}");
+            }
+            else
+            {
+                predictedPos = nh.position; // opzionale clamp
             }
         }
 
-        // 3) Vertical
-        if (enableVerticalClamp)
+        // 3) clamp verticale
+        if (ok && enableVerticalClamp)
         {
-            float dt = Mathf.Max(0.001f, dtServer);
-            float vy = (predictedPos.y - lastServerPos.y) / dt;
-            float limit = Mathf.Max(maxVerticalSpeed, 1.5f / dt);
-            if (Mathf.Abs(vy) > limit)
+            float vy = (predictedPos.y - lastServerPos.y) / Mathf.Max(dtServer, 0.001f);
+            if (Mathf.Abs(vy) > maxVerticalSpeed)
             {
-                MarkSuspicious(drv, seq, $"vy={vy:0.##} > {limit:0.##}");
-                if (debugLogs) Debug.LogWarning($"[AC] Suspicious seq={seq} vy={vy:0.##} > {limit:0.##}");
-                return false;
+                ok = false;
+                if (debugLogs)
+                    Debug.LogWarning($"[AC] client={drv?.OwnerClientId} seq={seq} vy={vy:0.###} > allowedVy={maxVerticalSpeed:0.###}");
             }
         }
 
-        // 4) Cheap sim validation (opzionale)
-        if (enableCheapSim)
+        // 4) cheap sim di velocità massima percorribile
+        if (ok && enableCheapSim)
         {
-            bool simOk = CheapSimValidate(drv, lastServerPos, predictedPos, dtServer, running);
-            if (!simOk)
+            float dist = Vector3.Distance(predictedPos, lastServerPos);
+            float simMax = allowedSpeed * dtServer * 1.5f; // 50% slack
+            if (dist > simMax + 0.001f)
             {
-                MarkSuspicious(drv, seq, "cheap-sim-fail");
-                if (debugLogs) Debug.LogWarning($"[AC] Suspicious seq={seq} cheap-sim-fail");
-                return false;
+                ok = false;
+                if (debugLogs)
+                    Debug.LogWarning($"[AC] client={drv?.OwnerClientId} seq={seq} dist={dist:0.###} > simMax={simMax:0.###}");
             }
         }
 
-        return true;
-    }
+        // bookkeeping / telemetria
+        int cid = (drv != null) ? drv.OwnerClientId : -1;
+        if (!_softFailCounts.ContainsKey(cid))
+            _softFailCounts[cid] = 0;
 
-    // Semplice simulazione server-side per la posizione attesa (non una replica perfetta della fisica)
-    bool CheapSimValidate(IPlayerNetworkDriver drv, Vector3 lastServerPos, Vector3 predictedPos, float dt, bool running)
-    {
-        if (drv == null) return true;
-        // Applica una forward-step con velocità massima attesa
-        float spd = 3.5f; // fallback speed (puoi prendere dal driver/core se necessario)
-        if (drv is PlayerNetworkDriverFishNet pdrv)
+        if (!ok)
         {
-            var core = pdrv.GetComponent<PlayerControllerCore>();
-            if (core != null) spd = core.speed * (core.IsRunning ? core.runMultiplier : 1f);
-        }
-        float maxMove = spd * Mathf.Max(0.001f, dt) * 1.15f; // tolleranza piccola
-        float planar = Vector3.Distance(new Vector3(lastServerPos.x, 0, lastServerPos.z), new Vector3(predictedPos.x, 0, predictedPos.z));
-        if (planar > maxMove + cheapSimTolerance) return false;
-        return true;
-    }
+            _softFailCounts[cid]++;
+            telemetry?.Increment($"anti_cheat.softfail.{cid}");
 
-    void MarkSuspicious(IPlayerNetworkDriver drv, uint seq, string reason)
-    {
-        _telemetry?.Increment("anti_cheat.suspicious_events");
-        if (_telemetry != null && drv != null)
+            if (_softFailCounts[cid] == maxSoftFailsBeforeWarning)
+                Debug.LogWarning($"[AC] Client {cid} ha raggiunto {maxSoftFailsBeforeWarning} soft-fail di movimento.");
+            else if (_softFailCounts[cid] >= maxSoftFailsBeforeQuarantine)
+                Debug.LogWarning($"[AC] Client {cid} ha superato {maxSoftFailsBeforeQuarantine} soft-fail. Considera kick/quarantine.");
+        }
+        else
         {
-            string key = $"client.{drv.OwnerClientId}.softfails";
-            _telemetry.Increment(key);
-            long fails = _telemetry.GetInt(key);
-
-            if (fails >= maxSoftFailsBeforeWarning && fails < maxSoftFailsBeforeQuarantine)
-            {
-                _telemetry?.Increment("anti_cheat.warnings");
-                if (debugLogs) Debug.LogWarning($"[AC] Warning client={drv.OwnerClientId} softfails={fails} ({reason})");
-            }
-            else if (fails >= maxSoftFailsBeforeQuarantine)
-            {
-                _telemetry?.Increment("anti_cheat.quarantines");
-                if (debugLogs) Debug.LogWarning($"[AC] Quarantine client={drv.OwnerClientId} after {fails} fails ({reason})");
-                // Nota: l'applicazione effettiva della quarantena (ad es. bloccare input) è un'azione di policy che il server game manager dovrebbe effettuare.
-            }
+            if (_softFailCounts[cid] > 0)
+                _softFailCounts[cid] = Mathf.Max(0, _softFailCounts[cid] - 1);
         }
+
+        return ok;
     }
 }
