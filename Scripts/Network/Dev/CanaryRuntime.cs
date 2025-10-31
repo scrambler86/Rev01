@@ -1,20 +1,20 @@
-﻿using System;
+﻿// BOOKMARK: FILE = CanaryRuntime.cs
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using FishNet;
 using FishNet.Object;
 using FishNet.Connection;
+using Game.Network.Adapters.FishNet; // <-- usa l'adapter
 
-// ===== BOOKMARK: CANARY_RUNTIME: HEADER =====
-// CanaryRuntime: invia payload di test (canary) ai client per verificare integrità trasporto
-// - Nessuna dipendenza da Channel.*
-// - Usa PlayerNetworkDriverFishNet per l'invio (shard/snapshot)
-// - Envelope degli shard contiene metadata del payload completo (len + hash)
-// ============================================
-
+/// <summary>
+/// CanaryRuntime: invia payload di test (canary) ai client per verificare integrità trasporto.
+/// - Nessuna dipendenza da Channel.*
+/// - Usa FishNetAdapter per inviare TargetRpc ai client
+/// - L'envelope può contenere metadata (len + hash) se serve ricostruzione client-side
+/// </summary>
 public class CanaryRuntime : NetworkBehaviour
 {
-    // ===== BOOKMARK: CANARY_RUNTIME: CONFIG =====
     [Header("Canary")]
     [Tooltip("Lunghezza del payload di test in byte.")]
     public int canaryLen = 2048;
@@ -40,11 +40,7 @@ public class CanaryRuntime : NetworkBehaviour
     [Header("Logging")]
     public bool verboseLogs = false;
 
-    // ===== BOOKMARK: CANARY_RUNTIME: STATE =====
     private byte[] _canaryPayload;
-
-    // OnValidate di Unity non è virtual → usiamo 'new' per evitare warning.
-    // Tenuto solo in Editor.
 #if UNITY_EDITOR
     protected new void OnValidate()
     {
@@ -57,7 +53,6 @@ public class CanaryRuntime : NetworkBehaviour
 
     private void Awake()
     {
-        // ===== BOOKMARK: CANARY_RUNTIME: BUILD_PAYLOAD =====
         _canaryPayload = BuildCanary(canaryLen);
     }
 
@@ -71,16 +66,14 @@ public class CanaryRuntime : NetworkBehaviour
 
     private void OnDisable()
     {
-        if (IsServer)
+        if (IsServerInitialized)
             CancelInvoke(nameof(BroadcastOnce));
     }
 
-    // ===== BOOKMARK: CANARY_RUNTIME: API =====
     public static byte[] BuildCanary(int len)
     {
         var b = new byte[len];
-        for (int i = 0; i < len; ++i)
-            b[i] = (byte)(i & 0xFF);
+        for (int i = 0; i < len; ++i) b[i] = (byte)(i & 0xFF);
         return b;
     }
 
@@ -89,7 +82,7 @@ public class CanaryRuntime : NetworkBehaviour
 
     public void BroadcastOnce(bool shards)
     {
-        if (!IsServer || !enabledRuntime) return;
+        if (!IsServerInitialized || !enabledRuntime) return;
         var dict = InstanceFinder.ServerManager?.Clients;
         if (dict == null || dict.Count == 0) return;
 
@@ -101,62 +94,30 @@ public class CanaryRuntime : NetworkBehaviour
         }
     }
 
-    // ===== BOOKMARK: CANARY_RUNTIME: SEND =====
     public void SendCanaryTo(NetworkConnection conn, bool shards)
     {
-        if (!IsServer || conn == null || _canaryPayload == null) return;
+        if (!IsServerInitialized || conn == null || _canaryPayload == null) return;
 
-        var driver = FindObjectOfType<PlayerNetworkDriverFishNet>();
-        if (driver == null)
+        // Trova un FishNetAdapter server-side (uno qualsiasi in scena)
+        var adapter = FindObjectOfType<FishNetAdapter>();
+        if (adapter == null)
         {
-            if (verboseLogs) Debug.LogWarning("[Canary] Driver non trovato, annullo invio.");
+            if (verboseLogs) Debug.LogWarning("[Canary] FishNetAdapter non trovato, annullo invio.");
             return;
         }
 
         if (shards && parity > 0)
         {
-            // Costruisci shard con metadata del payload COMPLETO nell'envelope
-            List<byte[]> sList = FecReedSolomon.BuildShards(_canaryPayload, shardSize, parity);
-            ulong fullHash = EnvelopeUtil.ComputeHash64(_canaryPayload);
-            int fullLen = _canaryPayload.Length;
-            uint seq = (uint)Environment.TickCount;
-            uint messageId = (uint)(DateTime.UtcNow.Ticks & 0xFFFFFFFF);
-
-            for (int i = 0; i < sList.Count; i++)
-            {
-                var shardBytes = sList[i];
-                Envelope env = new Envelope
-                {
-                    messageId = messageId,
-                    seq = seq,
-                    payloadLen = fullLen,     // FULL payload len
-                    payloadHash = fullHash,   // FULL payload hash
-                    flags = 0x4               // shard
-                };
-                var packed = EnvelopeUtil.Pack(env, shardBytes);
-                driver.SendPackedShardToClient(conn, packed);
-            }
-
-            if (verboseLogs || true)
-                Debug.Log($"[Canary] SHARDS sent to {conn.ClientId}, totalShards={sList.Count} fullLen={fullLen}");
+            // Qui puoi integrare il tuo FEC se serve. Per ora mandiamo lo shard "grezzo".
+            // TODO: rimettere FEC se necessario (FecReedSolomon.BuildShards).
+            var shard = _canaryPayload; // placeholder: inviamo l’intero come “shard”
+            adapter.Dev_SendCanaryTo(conn, shard, true);
+            if (verboseLogs) Debug.Log($"[Canary] SHARD sent to {conn.ClientId}, len={shard.Length}");
         }
         else
         {
-            // Invia payload intero come snapshot
-            uint seq = (uint)Environment.TickCount;
-            Envelope env = new Envelope
-            {
-                messageId = (uint)(DateTime.UtcNow.Ticks & 0xFFFFFFFF),
-                seq = seq,
-                payloadLen = _canaryPayload.Length,
-                payloadHash = EnvelopeUtil.ComputeHash64(_canaryPayload),
-                flags = 0x8 | 0x1 // snapshot + marker
-            };
-            var packed = EnvelopeUtil.Pack(env, _canaryPayload);
-            driver.SendPackedSnapshotToClient(conn, packed, env.payloadHash);
-
-            if (verboseLogs || true)
-                Debug.Log($"[Canary] SNAPSHOT sent to {conn.ClientId}, len={_canaryPayload.Length}");
+            adapter.Dev_SendCanaryTo(conn, _canaryPayload, false);
+            if (verboseLogs) Debug.Log($"[Canary] SNAPSHOT sent to {conn.ClientId}, len={_canaryPayload.Length}");
         }
     }
 }
