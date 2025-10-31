@@ -7,7 +7,7 @@ namespace Game.Network.Adapters.FishNet
 {
     [DisallowMultipleComponent]
     [RequireComponent(typeof(global::FishNet.Object.NetworkObject))]
-    [RequireComponent(typeof(PlayerNetworkDriver))] // 👉 obbliga il core sullo stesso GO
+    [RequireComponent(typeof(PlayerNetworkDriver))] // garantisce il core sullo stesso GO
     public class FishNetAdapter : global::FishNet.Object.NetworkBehaviour, Game.Network.INetAdapter
     {
         [SerializeField] private PlayerNetworkDriver core;
@@ -16,25 +16,17 @@ namespace Game.Network.Adapters.FishNet
         [SerializeField] private MonoBehaviour timeProviderBehaviour; // deve implementare ITimeProvider
         private Game.Network.ITimeProvider _timeProvider;
 
+        // Hiding voluto per evitare CS0108 warnings sul base class
         public new bool IsOwner => base.IsOwner;
         public new bool IsServer => base.IsServerInitialized;
 
         public event Action<Vector3, Quaternion, uint, float> SnapshotReceived;
 
-        private void Awake()
+        void Awake()
         {
-            // AUTO-BIND CORE
             if (core == null) core = GetComponent<PlayerNetworkDriver>();
-            if (core == null)
-            {
-                Debug.LogError("[FishNetAdapter] PlayerNetworkDriver mancante sullo stesso GameObject.");
-                return;
-            }
+            core?.EnsureRuntimeWiring();
 
-            // Assicura che il driver sia cablato (Rigidbody assegnato + gravità)
-            core.EnsureRuntimeWiring();
-
-            // AUTO-BIND TIME PROVIDER (se presente)
             if (timeProviderBehaviour is Game.Network.ITimeProvider tp)
                 _timeProvider = tp;
             else
@@ -72,6 +64,9 @@ namespace Game.Network.Adapters.FishNet
             }
         }
 
+        // ===========================================================
+        // INPUTS → SERVER → SNAPSHOT AGLI OBSERVER
+        // ===========================================================
         public void SendInputs(NetInputCmd[] inputs)
         {
             if (inputs == null || inputs.Length == 0) return;
@@ -100,16 +95,24 @@ namespace Game.Network.Adapters.FishNet
                 core.Adapter_OnRemoteSnapshot(serverTime, pos, rot);
         }
 
-        [global::FishNet.Object.TargetRpc]
-        private void TargetRpc_ReceiveCanary(global::FishNet.Connection.NetworkConnection conn, byte[] payload, bool isShard)
-        {
-            // hook diagnostico opzionale
-        }
-
+        // ===========================================================
+        // DEV CANARY (per CanaryRuntime) — RIPRISTINATO
+        // ===========================================================
+        /// <summary>
+        /// Invio diagnostico a un singolo client. Usato da CanaryRuntime.
+        /// </summary>
         public void Dev_SendCanaryTo(global::FishNet.Connection.NetworkConnection conn, byte[] payload, bool isShard)
         {
             if (!IsServerInitialized || conn == null || payload == null) return;
             TargetRpc_ReceiveCanary(conn, payload, isShard);
+        }
+
+        [global::FishNet.Object.TargetRpc]
+        private void TargetRpc_ReceiveCanary(global::FishNet.Connection.NetworkConnection conn, byte[] payload, bool isShard)
+        {
+            // Hook client-side per payload diagnostici.
+            // Se vuoi, notifica il core (opzionale):
+            // core?.Dev_OnCanary(payload, isShard);
         }
     }
 }
